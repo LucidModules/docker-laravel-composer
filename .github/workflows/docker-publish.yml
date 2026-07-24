@@ -1,25 +1,41 @@
 name: Build and Publish Docker Image
 
 on:
+  schedule:
+    # Weekly rebuild, after the base PHP images rebuild at 03:00.
+    - cron: '0 6 * * 0'
+  workflow_dispatch:
   push:
     branches: [ "master" ]
-    # Publish semver tags as releases.
-    tags: [ 'v*.*.*' ]
   pull_request:
     branches: [ "master" ]
 
 env:
-  # Use docker.io for Docker Hub if empty
-  REGISTRY: docker.io
-  # github.repository as <account>/<repo>
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE: docker.io/lucidmodules/docker-laravel-composer
 
 jobs:
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Discover latest Composer and PHP base versions
+        id: discover
+        run: python3 .github/scripts/discover.py
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   build:
+    needs: discover
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
 
     steps:
       - name: Checkout repository
@@ -38,24 +54,14 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha
-
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
+          pull: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            DOCKER_LARAVEL_PHP_VERSION=${{ matrix.php_line }}
+            COMPOSER_VERSION=${{ matrix.composer_version }}
+          tags: ${{ matrix.tags }}
