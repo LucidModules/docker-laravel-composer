@@ -2,10 +2,14 @@
 """Discover the latest Composer release and the maintained PHP base image lines
 (versions.json), and emit a GitHub Actions build matrix.
 
+Composer: newest release at least 7 days old (supply-chain cooldown), pinned by image digest
+and verified against the getcomposer.org sha256.
+
 One image is built per PHP line, on top of the corresponding
 lucidmodules/docker-laravel-php:<line> tag. Tags: <composer>-php<line> and
 <composer-minor>-php<line>; the newest PHP line also gets the plain
 <composer>, <minor>, <major> and latest tags."""
+import datetime as dt
 import functools
 import json
 import os
@@ -71,12 +75,73 @@ def hub_tags(repo):
     return tuple(tags)
 
 
+# Supply chain: only use Composer releases at least this old; hijacked releases are usually
+# caught and pulled within days. PHP itself is not delayed (security fixes go out ASAP).
+MIN_RELEASE_AGE_DAYS = 7
+COMPOSER_BIN_REPO = "composer/composer"
+MANIFEST_ACCEPT = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+])
+
+
+def version_key(version):
+    return tuple(map(int, version.split(".")))
+
+
+def dockerfile_default(arg):
+    """Default value of an ARG in the Dockerfile: the reviewed floor we never go below."""
+    m = re.search(rf"^ARG {arg}=(\S+)$", open("Dockerfile").read(), re.M)
+    if not m:
+        sys.exit(f"Dockerfile has no default for ARG {arg}")
+    return m.group(1)
+
+
+def manifest_digest(repo, tag):
+    """Digest of the multi-arch image index for repo:tag, or None if the tag doesn't exist."""
+    token = get_json(REGISTRY_AUTH.format(repo=repo))["token"]
+    req = urllib.request.Request(f"{REGISTRY}/v2/{repo}/manifests/{tag}", method="HEAD", headers={
+        "Authorization": f"Bearer {token}", "Accept": MANIFEST_ACCEPT, "User-Agent": "lucidmodules-ci"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return response.headers["Docker-Content-Digest"]
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+
+
+def composer_sha256(version):
+    """sha256 of composer.phar as published on getcomposer.org (a second, independent channel)."""
+    url = f"https://getcomposer.org/download/{version}/composer.phar.sha256sum"
+    req = urllib.request.Request(url, headers={"User-Agent": "lucidmodules-ci"})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        sha = response.read().decode().split()[0]
+    if not re.fullmatch(r"[0-9a-f]{64}", sha):
+        sys.exit(f"unexpected checksum from {url}: {sha!r}")
+    return sha
+
+
 def latest_composer():
-    release = get_json("https://api.github.com/repos/composer/composer/releases/latest")
-    version = release["tag_name"].lstrip("v")
-    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-        sys.exit(f"unexpected composer version: {version}")
-    return version
+    """Newest stable Composer release that is at least MIN_RELEASE_AGE_DAYS old, not older than
+    the Dockerfile default, and published as a composer/composer:<version>-bin image.
+    Returns (version, image digest, composer.phar sha256)."""
+    floor = dockerfile_default("COMPOSER_VERSION")
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=MIN_RELEASE_AGE_DAYS)
+    candidates = []
+    for release in get_json("https://api.github.com/repos/composer/composer/releases?per_page=50"):
+        version = release["tag_name"].lstrip("v")
+        published = dt.datetime.fromisoformat(release["published_at"].replace("Z", "+00:00"))
+        if release["draft"] or release["prerelease"] or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+            continue
+        if published <= cutoff or version == floor:
+            candidates.append(version)
+    candidates = sorted((v for v in candidates if version_key(v) >= version_key(floor)), key=version_key, reverse=True)
+    for version in candidates:
+        if digest := manifest_digest(COMPOSER_BIN_REPO, f"{version}-bin"):
+            return version, digest, composer_sha256(version)
+        print(f"::warning::{COMPOSER_BIN_REPO}:{version}-bin not published, trying an older release", file=sys.stderr)
+    sys.exit(f"no Composer release >= {floor} that is {MIN_RELEASE_AGE_DAYS}+ days old with a -bin image")
 
 
 def base_exists(line):
@@ -87,7 +152,7 @@ def main():
     lines = json.load(open("versions.json"))["php_lines"]
     lines.sort(key=lambda l: tuple(map(int, l.split("."))))
 
-    composer = latest_composer()
+    composer, composer_digest, composer_sha256_ = latest_composer()
     major, minor, _ = composer.split(".")
     composer_minor = f"{major}.{minor}"
 
@@ -110,6 +175,8 @@ def main():
         entries.append({
             "php_line": line,
             "composer_version": composer,
+            "composer_digest": composer_digest,
+            "composer_sha256": composer_sha256_,
             "tags": ",".join(f"{IMAGE}:{t}" for t in tags),
         })
 
